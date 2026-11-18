@@ -4,27 +4,30 @@
 
 from collections.abc import Iterable
 
+import re
+from collections import defaultdict
+
 import torch
 from torch import nn
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
-from vllm.model_executor.layers.sensenova_loop_mhc import MHCRouter
+from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsMRoPE
+from vllm.model_executor.models.qwen3_5 import (
+    Qwen3_5DecoderLayer,
+    Qwen3_5ForCausalLMBase,
+    Qwen3_5Model,
+    Qwen3_5RMSNorm,
+)
+from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import HasInnerState, IsHybrid, SupportsMRoPE
-from .qwen3_5 import (
-    Qwen3_5DecoderLayer,
-    Qwen3_5ForCausalLMBase,
-    Qwen3_5Model,
-    Qwen3_5RMSNorm,
-)
-from .utils import AutoWeightsLoader, maybe_prefix
+from vllm_sensenova_loop.mhc import MHCRouter
 
 
 class SenseNovaLoopDecoderLayer(Qwen3_5DecoderLayer):
@@ -77,7 +80,7 @@ class SenseNovaLoopModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         self.config = vllm_config.model_config.hf_text_config
-        self.quant_config = None
+        self.quant_config = vllm_config.quant_config
         self.vocab_size = self.config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
@@ -128,9 +131,54 @@ class SenseNovaLoopModel(nn.Module):
         )
 
 
+SUPPORTED_QUANTIZATION = {"modelopt_fp4"}
+
+
+def remap_exclude_modules(quant_config, loop_indices) -> None:
+    """Translate a ModelOpt exclude list from checkpoint to vLLM module names.
+
+    The checkpoint names physical layers (``model.language_model.layers.30``);
+    vLLM builds one module per execution (``model.layers.0..55``) so every loop
+    visit owns its cache. Each physical-layer entry is expanded to all of its
+    executions. ``prefix*`` subtree wildcards are split into ``prefix`` and
+    ``prefix.*`` first, as ModelOptQuantConfigBase.apply_vllm_mapper does.
+    """
+    exclude = getattr(quant_config, "exclude_modules", None)
+    if not exclude or getattr(quant_config, "_sensenova_loop_remapped", False):
+        return
+    executions: dict[int, list[int]] = defaultdict(list)
+    for execution, physical in enumerate(loop_indices):
+        executions[physical].append(execution)
+    remapped: set[str] = set()
+    for pattern in exclude:
+        if len(pattern) >= 2 and pattern[-1] == "*" and pattern[-2] != ".":
+            patterns = [pattern[:-1], pattern[:-1] + ".*"]
+        else:
+            patterns = [pattern]
+        for p in patterns:
+            p = p.replace("model.language_model.", "model.", 1)
+            m = re.fullmatch(r"model\.layers\.(\d+)(\..*)?", p)
+            if m is None:
+                remapped.add(p)
+                continue
+            for execution in executions.get(int(m.group(1)), ()):
+                remapped.add(f"model.layers.{execution}{m.group(2) or ''}")
+    quant_config.exclude_modules = sorted(remapped)
+    quant_config._sensenova_loop_remapped = True
+
+
 class SenseNovaLoopForConditionalGeneration(
     nn.Module, HasInnerState, IsHybrid, SupportsMRoPE
 ):
+    # Fused projections, as in Qwen3.5. Passed by reference to the quant config
+    # so exclude lists written per checkpoint shard match the fused modules.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
+
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls, vllm_config: VllmConfig
@@ -158,16 +206,22 @@ class SenseNovaLoopForConditionalGeneration(
         self.config = self.model_config.hf_text_config
         if (
             vllm_config.parallel_config.pipeline_parallel_size != 1
-            or vllm_config.quant_config is not None
             or vllm_config.speculative_config is not None
             or vllm_config.lora_config is not None
             or getattr(self.config, "layer_scale", False)
         ):
             raise ValueError(
-                "SenseNova Loop currently requires unquantized text inference "
-                "without pipeline parallelism, LoRA, speculation or layer_scale"
+                "SenseNova Loop currently requires text inference without "
+                "pipeline parallelism, LoRA, speculation or layer_scale"
             )
-        self.quant_config = None
+        self.quant_config = vllm_config.quant_config
+        if self.quant_config is not None:
+            if self.quant_config.get_name() not in SUPPORTED_QUANTIZATION:
+                raise ValueError(
+                    f"SenseNova Loop supports {sorted(SUPPORTED_QUANTIZATION)} "
+                    f"checkpoints, got {self.quant_config.get_name()!r}"
+                )
+            remap_exclude_modules(self.quant_config, self.config.loop_physical_indices)
         self.scheduler_config = vllm_config.scheduler_config
         self.model = SenseNovaLoopModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")

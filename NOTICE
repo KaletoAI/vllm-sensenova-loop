@@ -1,0 +1,10 @@
+vllm-sensenova-loop
+
+The model, mHC layer, Triton kernels and config in src/vllm_sensenova_loop/
+are derived from vllm-project/vllm pull request #64832 "[Model] Add SenseNova
+Loop support" by sufubao (head 86014ad44c3fab4be89dfc169f5365ed850fd195),
+Copyright contributors to the vLLM project, licensed under Apache-2.0.
+The first commit of this repository contains those files unchanged.
+
+SenseNova Loop model architecture and weights: SenseNova / SenseTime
+(sensenova/SenseNova-Loop-9B, Apache-2.0).

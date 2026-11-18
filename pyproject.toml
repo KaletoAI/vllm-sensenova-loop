@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-sensenova-loop"
+version = "0.1.0.dev0"
+description = "Out-of-tree vLLM plugin for SenseNova Loop (looped Qwen3.5 + mHC), incl. ModelOpt NVFP4"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+# vLLM is provided by the serving environment; tested against vllm==0.31.0.
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+sensenova_loop = "vllm_sensenova_loop:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]
