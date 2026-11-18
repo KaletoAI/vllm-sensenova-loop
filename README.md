@@ -45,7 +45,7 @@ Not tested yet: tensor parallelism (the upstream code supports it), the Preview 
 Into an environment that already has `vllm==0.31.0`:
 
 ```bash
-pip install --no-deps git+https://github.com/KaletoAI/vllm-sensenova-loop
+pip install --no-deps https://github.com/KaletoAI/vllm-sensenova-loop/archive/refs/heads/master.tar.gz
 vllm serve sensenova/SenseNova-Loop-9B --max-model-len 32768
 ```
 
@@ -59,7 +59,7 @@ With the official image, install the plugin at container start:
 docker run --rm --gpus all --network host --ipc host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --entrypoint bash vllm/vllm-openai:v0.31.0 -c "
-    pip install -q --no-deps git+https://github.com/KaletoAI/vllm-sensenova-loop &&
+    pip install -q --no-deps https://github.com/KaletoAI/vllm-sensenova-loop/archive/refs/heads/master.tar.gz &&
     exec vllm serve Kaleto/SenseNova-Loop-9B-NVFP4 \
       --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder \
       --max-model-len 32768 --max-num-seqs 3"
