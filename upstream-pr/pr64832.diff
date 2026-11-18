@@ -1,0 +1,943 @@
+diff --git a/docs/models/sensenova_loop.md b/docs/models/sensenova_loop.md
+new file mode 100644
+index 000000000000..1a09b205a351
+--- /dev/null
++++ b/docs/models/sensenova_loop.md
+@@ -0,0 +1,107 @@
++# SenseNova Loop with mHC
++
++The `SenseNovaLoopForConditionalGeneration` implementation serves text from
++the public [SenseNova-Loop-9B-Preview](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview)
++checkpoint and compatible `sensenova_loop` checkpoints. It uses a fixed
++`loop_settings.eval_count`, shares repeated layer parameters, and keeps separate
++attention and recurrent caches for every execution of a layer. Optional mHC
++routers retain FP32 weights and use log-space Sinkhorn normalization.
++
++The implementation requires unquantized weights. On NVIDIA GPUs, it defaults to
++full decode CUDA Graphs without Torch compilation; prefill executes eagerly.
++Explicit compilation settings and `--enforce-eager` take precedence.
++It supports tensor parallelism, but not pipeline parallelism, vision, audio,
++LoRA, speculative decoding, learned loop gates, or layer scaling. CPU weight
++offloading is unsupported with shared loop weights: nonzero `--cpu-offload-gb`
++or `--offload-group-size` is rejected before workers start.
++The `sharded_state` and `runai_streamer_sharded` load formats are also rejected
++before workers start. Sharded-state exports deduplicate shared parameters, but
++this model restores their aliases only after weight processing. Load the original
++checkpoint with `auto` or `safetensors` instead of a `save_sharded_state` export.
++
++SSM cache precision follows the checkpoint's `mamba_ssm_dtype` when
++`--mamba-ssm-cache-dtype` is `auto`. The public checkpoint uses FP32 SSM state
++even with BF16 weights and convolution state. An explicit
++`--mamba-ssm-cache-dtype` setting takes precedence.
++
++```bash
++vllm serve sensenova/SenseNova-Loop-9B-Preview \
++  --served-model-name sensenova_loop \
++  --tensor-parallel-size 2 \
++  --dtype bfloat16 \
++  --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8]}' \
++  --max-model-len 4096 \
++  --max-num-seqs 8 \
++  --host 127.0.0.1 --port 8001
++```
++
++The public checkpoint loads natively without `--trust-remote-code` or
++architecture overrides. Its [reference implementation](https://huggingface.co/sensenova/SenseNova-Loop-9B-Preview/blob/main/modeling_sensenova_loop.py)
++and weights are published under Apache 2.0. The checkpoint includes vision and
++MTP weights; this implementation loads the text backbone and mHC routers and
++ignores those additional weights. Image inputs and MTP remain unsupported.
++
++Native loading expects the following top-level fields in `config.json`, alongside
++the checkpoint's text, loop and mHC settings:
++
++```json
++{
++  "model_type": "sensenova_loop",
++  "architectures": ["SenseNovaLoopForConditionalGeneration"]
++}
++```
++
++To override the loop count or mHC settings at startup, pass their complete
++objects through `--hf-overrides`. The execution plan and mHC boundary checks
++are recomputed after overrides; physical checkpoint layers remain unchanged.
++Setting `loop_settings` to `null` runs each physical layer once and retains
++the mHC settings. The mHC `pre_scale` must be a positive finite number.
++
++```bash
++--hf-overrides '{"loop_settings":{"start":4,"end":28,"eval_count":3}}'
++```
++
++## Execution plan and parameter sharing
++
++The checkpoint describes physical layers. vLLM needs one logical layer for each
++execution of a physical layer, including repetitions, so it can allocate separate
++attention and recurrent cache state. `SenseNovaLoopConfig` expands the physical
++layer indices and attention types before model initialization. It retains the
++physical metadata and rebuilds the plan after `--hf-overrides`; applying an
++override therefore does not expand an already expanded plan.
++
++Each logical layer has its own module and cache identity. A model post-load hook
++ties repeated layers' parameters after loading and weight processing, including
++dummy initialization. Reusing the entire decoder module would also reuse its
++cache identity, which would mix states from different loop iterations. Parameter
++sharing reduces steady-state weight memory, but does not reduce the number of
++attention or recurrent cache entries. At load time, repeated layers temporarily
++allocate separate weights before tying parameters, so allow additional memory
++during initialization. Vision weights are ignored for text inference.
++
++The native implementation reuses Qwen3.5 attention, recurrent-state helpers,
++normalization, MLP and weight-loading components. It supplies the loop execution
++plan and mHC residual-stream operations while keeping the scheduler and model
++runner unchanged. The custom config adapts checkpoint metadata to vLLM's logical
++layer layout; it is not a replacement for the checkpoint's reference model.
++The HF reference maps each physical-layer visit to a separate `DynamicCache`
++slot. The native model expresses these execution slots through vLLM's hybrid
++model interfaces, so both attention and recurrent state follow the loop plan.
++
++## mHC numerical behavior
++
++BF16 CUDA inference reuses vLLM's
++`hc_collapse_triton` mHC stream reduction. Coefficients are rounded to BF16
++before reduction, as in the checkpoint implementation. A fused Triton kernel
++performs log-space Sinkhorn normalization. Residual merging preserves the
++checkpoint's matrix orientation and BF16 intermediate rounding; the generic
++`MHCPreOp` and `MHCPostOp` use different normalization and rounding conventions.
++
++CUDA routing uses a fused FP32 RMS normalization and, for up to 32 tokens, a
++split-K FP32 projection. Larger batches retain the cuBLAS projection. Two-stream
++BF16 residual merging is fused into one kernel; wider streams retain the
++original matrix multiplication to preserve its accumulation order. These paths
++support CUDA Graph replay without reducing router precision.
++
++Use `--enforce-eager` instead of the compilation configuration for an eager
++baseline. Add `--cudagraph-metrics` to inspect actual graph dispatch statistics.
+diff --git a/docs/models/supported_models.md b/docs/models/supported_models.md
+index efd9ef5fd9cb..a1a0a72c89c1 100644
+--- a/docs/models/supported_models.md
++++ b/docs/models/supported_models.md
+@@ -468,6 +468,7 @@ th {
+ | `Rnj1ForCausalLM` | Rnj1 | `EssentialAI/rnj-1-instruct`, etc. | | |
+ | `SarvamMoEForCausalLM` | Sarvam 2 | `sarvamai/sarvam2-30b-a3b`, etc. | ✅︎ | ✅︎ |
+ | `SarvamMLAForCausalLM` | Sarvam 2 | `sarvamai/sarvam2-105b-a9b`, etc. | | ✅︎ |
++| `SenseNovaLoopForConditionalGeneration` | [SenseNova Loop](sensenova_loop.md) | `sensenova/SenseNova-Loop-9B-Preview` | | |
+ | `SolarForCausalLM` | Solar Pro | `upstage/solar-pro-preview-instruct`, etc. | ✅︎ | ✅︎ |
+ | `StableLmForCausalLM` | StableLM | `stabilityai/stablelm-3b-4e1t`, `stabilityai/stablelm-base-alpha-7b-v2`, etc. | | |
+ | `Step1ForCausalLM` | Step-Audio | `stepfun-ai/Step-Audio-EditX`, etc. | ✅︎ | ✅︎ |
+diff --git a/tests/models/registry.py b/tests/models/registry.py
+index 04d6446596eb..904406e6cdba 100644
+--- a/tests/models/registry.py
++++ b/tests/models/registry.py
+@@ -564,6 +564,11 @@ def check_available_online(
+         "ByteDance-Seed/Seed-OSS-36B-Instruct",
+         trust_remote_code=True,
+     ),
++    "SenseNovaLoopForConditionalGeneration": _HfExamplesInfo(
++        "sensenova/SenseNova-Loop-9B-Preview",
++        max_model_len=4096,
++        max_num_seqs=2,
++    ),
+     "SmolLM3ForCausalLM": _HfExamplesInfo("HuggingFaceTB/SmolLM3-3B"),
+     "StableLmForCausalLM": _HfExamplesInfo("stabilityai/stablelm-3b-4e1t"),
+     "Starcoder2ForCausalLM": _HfExamplesInfo("bigcode/starcoder2-3b"),
+diff --git a/tests/models/utils.py b/tests/models/utils.py
+index f5c0cf97b36f..df800cc85759 100644
+--- a/tests/models/utils.py
++++ b/tests/models/utils.py
+@@ -556,6 +556,23 @@ def _supports_multimodal_for_mm_prefix() -> bool:
+ 
+     text_config.update(update_dict)
+ 
++    if (
++        model_arch == "SenseNovaLoopForConditionalGeneration"
++        and not use_original_num_layers
++        and hasattr(hf_config, "loop_physical_layer_types")
++    ):
++        layer_types = list(dict.fromkeys(hf_config.loop_physical_layer_types))
++        num_physical_layers = len(layer_types)
++        hf_config.loop_physical_num_layers = num_physical_layers
++        hf_config.loop_physical_layer_types = layer_types
++        hf_config.loop_settings = {
++            "start": 0,
++            "end": num_physical_layers,
++            "eval_count": 2,
++        }
++        if hf_config.mhc is not None:
++            hf_config.mhc = dict(hf_config.mhc, start=0, end=num_physical_layers)
++
+     # Keep per-layer metadata consistent with the reduced layer count.
+     # HY V4 uses this to decide which sparse-attention indexers are shared.
+     if indexer_types := getattr(text_config, "indexer_types", None):
+diff --git a/vllm/model_executor/kernels/mhc/sensenova_loop.py b/vllm/model_executor/kernels/mhc/sensenova_loop.py
+new file mode 100644
+index 000000000000..76479682fa64
+--- /dev/null
++++ b/vllm/model_executor/kernels/mhc/sensenova_loop.py
+@@ -0,0 +1,262 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""SenseNova Loop routing with FP32 logits and BF16 stream coefficients."""
++
++import torch
++from torch import Tensor
++
++from vllm.triton_utils import tl, tldevice, triton
++
++
++@triton.jit
++def _mhc_rmsnorm_kernel(
++    x,
++    out,
++    stride_t: tl.constexpr,
++    stride_s: tl.constexpr,
++    stride_h: tl.constexpr,
++    hidden: tl.constexpr,
++    streams: tl.constexpr,
++    block: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    offsets = tl.arange(0, block)
++    values = tl.load(
++        x
++        + token * stride_t
++        + offsets // hidden * stride_s
++        + offsets % hidden * stride_h,
++        offsets < hidden * streams,
++        0,
++    ).to(tl.float32)
++    inv = tl.rsqrt(tl.sum(values * values, 0) / (hidden * streams) + 1e-6)
++    tl.store(
++        out + token * hidden * streams + offsets,
++        values * inv,
++        offsets < hidden * streams,
++    )
++
++
++def mhc_rmsnorm_triton(x: Tensor) -> Tensor:
++    """Normalize residual streams into a contiguous FP32 routing input."""
++    tokens, streams, hidden = x.shape
++    out = torch.empty((tokens, streams * hidden), device=x.device, dtype=torch.float32)
++    if tokens:
++        block = triton.next_power_of_2(streams * hidden)
++        _mhc_rmsnorm_kernel[(tokens,)](
++            x,
++            out,
++            *x.stride(),
++            hidden,
++            streams,
++            block,
++            num_warps=4 if block <= 4096 else 8,
++            enable_fp_fusion=False,
++        )
++    return out
++
++
++@triton.jit
++def _mhc_project_partial_kernel(
++    x,
++    weight,
++    partial,
++    width: tl.constexpr,
++    outputs: tl.constexpr,
++    splits: tl.constexpr,
++    block: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    split = tl.program_id(1)
++    token = row // outputs
++    output = row % outputs
++    offsets = split * block + tl.arange(0, block)
++    a = tl.load(x + token * width + offsets, offsets < width, 0)
++    b = tl.load(weight + output * width + offsets, offsets < width, 0)
++    value = tl.sum(a * b, 0)
++    tl.store(partial + row * splits + split, value)
++
++
++@triton.jit
++def _mhc_project_reduce_kernel(
++    partial,
++    bias,
++    out,
++    outputs: tl.constexpr,
++    splits: tl.constexpr,
++    block: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    offsets = tl.arange(0, block)
++    values = tl.load(partial + row * splits + offsets, offsets < splits, 0)
++    value = tl.sum(values, 0) + tl.load(bias + row % outputs)
++    tl.store(out + row, value)
++
++
++def mhc_project_triton(x: Tensor, weight: Tensor, bias: Tensor) -> Tensor:
++    """Split-K FP32 projection for small decode routing matrices."""
++    tokens, width = x.shape
++    outputs = weight.shape[0]
++    block = 2048 if tokens >= 32 else 1024
++    splits = triton.cdiv(width, block)
++    partial = torch.empty((tokens * outputs, splits), device=x.device, dtype=x.dtype)
++    out = torch.empty((tokens, outputs), device=x.device, dtype=x.dtype)
++    if tokens:
++        _mhc_project_partial_kernel[(tokens * outputs, splits)](
++            x,
++            weight,
++            partial,
++            width,
++            outputs,
++            splits,
++            block,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++        _mhc_project_reduce_kernel[(tokens * outputs,)](
++            partial,
++            bias,
++            out,
++            outputs,
++            splits,
++            triton.next_power_of_2(splits),
++            num_warps=1,
++            enable_fp_fusion=False,
++        )
++    return out
++
++
++@triton.jit
++def _mhc_merge_kernel(
++    residual,
++    branch,
++    post,
++    mix,
++    out,
++    residual_stride_t: tl.constexpr,
++    residual_stride_s: tl.constexpr,
++    residual_stride_h: tl.constexpr,
++    branch_stride_t: tl.constexpr,
++    branch_stride_h: tl.constexpr,
++    post_stride_t: tl.constexpr,
++    post_stride_s: tl.constexpr,
++    mix_stride_t: tl.constexpr,
++    mix_stride_row: tl.constexpr,
++    mix_stride_col: tl.constexpr,
++    hidden: tl.constexpr,
++    streams: tl.constexpr,
++    block: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    offsets = tl.program_id(1) * block + tl.arange(0, block)
++    x = tl.load(
++        branch + token * branch_stride_t + offsets * branch_stride_h,
++        offsets < hidden,
++        0,
++    ).to(tl.float32)
++    for row in tl.static_range(streams):
++        mixed = tl.full((block,), 0, tl.float32)
++        for col in tl.static_range(streams):
++            coefficient = tl.load(
++                mix + token * mix_stride_t + row * mix_stride_row + col * mix_stride_col
++            )
++            coefficient = coefficient.to(tl.bfloat16).to(tl.float32)
++            r = tl.load(
++                residual
++                + token * residual_stride_t
++                + col * residual_stride_s
++                + offsets * residual_stride_h,
++                offsets < hidden,
++                0,
++            ).to(tl.float32)
++            mixed = tl.fma(coefficient, r, mixed)
++        p = (
++            tl.load(post + token * post_stride_t + row * post_stride_s)
++            .to(tl.bfloat16)
++            .to(tl.float32)
++        )
++        update = (p * x).to(tl.bfloat16).to(tl.float32)
++        value = mixed.to(tl.bfloat16).to(tl.float32) + update
++        tl.store(
++            out + (token * streams + row) * hidden + offsets, value, offsets < hidden
++        )
++
++
++def mhc_merge_triton(
++    residual: Tensor, branch: Tensor, post: Tensor, mix: Tensor
++) -> Tensor:
++    """Merge output-to-input mixing matrices with BF16 intermediate rounding."""
++    tokens, streams, hidden = residual.shape
++    if streams != 2:
++        # Preserve cuBLAS accumulation order for wider residual streams.
++        return mix.to(residual.dtype) @ residual + (
++            post.to(branch.dtype).unsqueeze(-1) * branch.unsqueeze(-2)
++        )
++    out = torch.empty(residual.shape, device=residual.device, dtype=residual.dtype)
++    mix_strides = (0, *mix.stride()) if mix.ndim == 2 else mix.stride()
++    if tokens:
++        _mhc_merge_kernel[(tokens, triton.cdiv(hidden, 512))](
++            residual,
++            branch,
++            post,
++            mix,
++            out,
++            *residual.stride(),
++            *branch.stride(),
++            *post.stride(),
++            *mix_strides,
++            hidden,
++            streams,
++            512,
++            num_warps=4,
++            enable_fp_fusion=False,
++        )
++    return out
++
++
++@triton.jit
++def _mhc_log_sinkhorn_kernel(
++    logits,
++    output,
++    stride_t: tl.constexpr,
++    streams: tl.constexpr,
++    iterations: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    row = tl.arange(0, streams)
++    col = tl.arange(0, streams)
++    offsets = row[:, None] * streams + col[None, :]
++    mix = tl.load(logits + token * stride_t + offsets)
++    for _ in range(iterations):
++        maximum = tl.max(mix, 1)
++        normalizer = maximum + tldevice.log(
++            tl.sum(tldevice.exp(mix - maximum[:, None]), 1)
++        )
++        mix = mix - normalizer[:, None]
++        maximum = tl.max(mix, 0)
++        normalizer = maximum + tldevice.log(
++            tl.sum(tldevice.exp(mix - maximum[None, :]), 0)
++        )
++        mix = mix - normalizer[None, :]
++    tl.store(output + token * streams * streams + offsets, tldevice.exp(mix))
++
++
++def mhc_log_sinkhorn_triton(logits: Tensor, iterations: int) -> Tensor:
++    """Normalize FP32 mHC logits by alternating log-space row/column sums."""
++    assert logits.ndim == 3 and logits.dtype == torch.float32
++    tokens, streams, columns = logits.shape
++    assert streams in (2, 4) and columns == streams
++    assert logits.stride(-1) == 1 and logits.stride(-2) == streams
++    assert iterations > 0
++    output = torch.empty(logits.shape, device=logits.device, dtype=logits.dtype)
++    if tokens:
++        _mhc_log_sinkhorn_kernel[(tokens,)](
++            logits,
++            output,
++            logits.stride(0),
++            streams,
++            iterations,
++            num_warps=1,
++            enable_fp_fusion=False,
++        )
++    return output
+diff --git a/vllm/model_executor/layers/sensenova_loop_mhc.py b/vllm/model_executor/layers/sensenova_loop_mhc.py
+new file mode 100644
+index 000000000000..16985303e05b
+--- /dev/null
++++ b/vllm/model_executor/layers/sensenova_loop_mhc.py
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from typing import Any
++
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++
++class MHCRouter(nn.Module):
++    def __init__(self, hidden_size: int, settings: dict[str, Any]) -> None:
++        super().__init__()
++        self.streams = settings["streams"]
++        self.iterations = settings["iterations"]
++        self.fixed_identity = settings["fixed_identity"]
++        self.pre_scale = settings.get("pre_scale", 1.0)
++        num_outputs = 2 * self.streams
++        if not self.fixed_identity:
++            num_outputs += self.streams**2
++        self.weight = nn.Parameter(
++            torch.empty(num_outputs, self.streams * hidden_size, dtype=torch.float32),
++            requires_grad=False,
++        )
++        self.bias = nn.Parameter(
++            torch.empty(num_outputs, dtype=torch.float32), requires_grad=False
++        )
++
++    def forward(
++        self, residual: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        if residual.is_cuda:
++            from vllm.model_executor.kernels.mhc import sensenova_loop as mhc_kernels
++            from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
++
++            normalized = mhc_kernels.mhc_rmsnorm_triton(residual)
++        else:
++            flat = residual.flatten(-2).float()
++            normalized = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + 1e-6)
++
++        if residual.is_cuda and residual.shape[0] <= 32:
++            logits = mhc_kernels.mhc_project_triton(normalized, self.weight, self.bias)
++        else:
++            logits = F.linear(normalized, self.weight, self.bias)
++
++        streams = self.streams
++        pre = logits[..., :streams].sigmoid()
++        post = 2 * logits[..., streams : 2 * streams].sigmoid()
++        if self.fixed_identity:
++            mix = torch.eye(streams, device=residual.device, dtype=torch.float32)
++        else:
++            mix = logits[..., 2 * streams :].unflatten(-1, (streams, streams))
++            if residual.is_cuda:
++                mix = mhc_kernels.mhc_log_sinkhorn_triton(mix, self.iterations)
++            else:
++                for _ in range(self.iterations):
++                    mix = mix - mix.logsumexp(-1, keepdim=True)
++                    mix = mix - mix.logsumexp(-2, keepdim=True)
++                mix = mix.exp()
++        if residual.is_cuda and residual.dtype == torch.bfloat16:
++            # The checkpoint rounds coefficients before stream reduction.
++            branch = hc_collapse_triton(residual, pre.to(residual.dtype).float())
++        else:
++            branch = (pre.to(residual.dtype).unsqueeze(-2) @ residual).squeeze(-2)
++        return branch * self.pre_scale, post, mix
++
++    @staticmethod
++    def merge(
++        residual: torch.Tensor,
++        branch: torch.Tensor,
++        post: torch.Tensor,
++        mix: torch.Tensor,
++    ) -> torch.Tensor:
++        if residual.is_cuda and residual.dtype == torch.bfloat16:
++            from vllm.model_executor.kernels.mhc.sensenova_loop import mhc_merge_triton
++
++            return mhc_merge_triton(residual, branch, post, mix)
++        mixed = mix.to(residual.dtype) @ residual
++        update = post.to(branch.dtype).unsqueeze(-1) * branch.unsqueeze(-2)
++        return mixed + update
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index 57411849e2be..777a8db23794 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -64,6 +64,34 @@ def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+             )
+ 
+ 
++class SenseNovaLoopConfig(VerifyAndUpdateConfig):
++    @staticmethod
++    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
++        from vllm.config.compilation import CompilationMode, CUDAGraphMode
++        from vllm.platforms import current_platform
++
++        Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
++        if vllm_config.load_config.load_format in (
++            "sharded_state",
++            "runai_streamer_sharded",
++        ):
++            raise NotImplementedError(
++                "SenseNova Loop does not support loading sharded state "
++                "with shared loop weights; load the original checkpoint instead"
++            )
++        offload = vllm_config.offload_config
++        if offload.uva.cpu_offload_gb > 0 or offload.prefetch.offload_group_size > 0:
++            raise NotImplementedError(
++                "SenseNova Loop does not support CPU offload with shared loop weights"
++            )
++        if current_platform.is_cuda():
++            compilation_config = vllm_config.compilation_config
++            if compilation_config.mode is None:
++                compilation_config.mode = CompilationMode.NONE
++            if compilation_config.cudagraph_mode is None:
++                compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
++
++
+ class DeepseekV32ForCausalLM(VerifyAndUpdateConfig):
+     @classmethod
+     def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+@@ -1337,6 +1365,7 @@ def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+     "Qwen4ExpForCausalLM": Qwen4ExpForCausalLMConfig,
+     "Qwen4ExpForConditionalGeneration": (Qwen4ExpForConditionalGenerationConfig),
+     "Qwen4ExpMTP": Qwen4ExpMTPConfig,
++    "SenseNovaLoopForConditionalGeneration": SenseNovaLoopConfig,
+     "UnlimitedOCRForCausalLM": UnlimitedOCRForCausalLMConfig,
+     "VoyageQwen3BidirectionalEmbedModel": VoyageQwen3BidirectionalEmbedModelConfig,
+     "XLMRobertaModel": JinaRobertaModelConfig,
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index 3c8d6bccbe7d..830bdbf2de0c 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -204,6 +204,10 @@
+     "Qwen3_5MoeForCausalLM": ("vllm.models.qwen3_5", "Qwen3_5MoeForCausalLM"),
+     "SarvamMoEForCausalLM": ("sarvam", "SarvamMoEForCausalLM"),
+     "SarvamMLAForCausalLM": ("sarvam", "SarvamMLAForCausalLM"),
++    "SenseNovaLoopForConditionalGeneration": (
++        "sensenova_loop",
++        "SenseNovaLoopForConditionalGeneration",
++    ),
+     "Step1ForCausalLM": ("step1", "Step1ForCausalLM"),
+     "Step3TextForCausalLM": ("step3_text", "Step3TextForCausalLM"),
+     "Step3p5ForCausalLM": ("step3p5", "Step3p5ForCausalLM"),
+diff --git a/vllm/model_executor/models/sensenova_loop.py b/vllm/model_executor/models/sensenova_loop.py
+new file mode 100644
+index 000000000000..9eea80301ec9
+--- /dev/null
++++ b/vllm/model_executor/models/sensenova_loop.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Text inference for fixed-count SenseNova Loop checkpoints with optional mHC."""
++
++from collections.abc import Iterable
++
++import torch
++from torch import nn
++
++from vllm.config import VllmConfig
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFunc
++from vllm.model_executor.layers.sensenova_loop_mhc import MHCRouter
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.sequence import IntermediateTensors
++
++from .interfaces import HasInnerState, IsHybrid, SupportsMRoPE
++from .qwen3_5 import (
++    Qwen3_5DecoderLayer,
++    Qwen3_5ForCausalLMBase,
++    Qwen3_5Model,
++    Qwen3_5RMSNorm,
++)
++from .utils import AutoWeightsLoader, maybe_prefix
++
++
++class SenseNovaLoopDecoderLayer(Qwen3_5DecoderLayer):
++    def __init__(self, vllm_config: VllmConfig, layer_type: str, prefix: str) -> None:
++        super().__init__(vllm_config, layer_type, prefix)
++        config = vllm_config.model_config.hf_text_config
++        self.physical_index = config.loop_physical_indices[self.layer_idx]
++        self.mhc = config.mhc
++        self.mhc_active = self.mhc is not None and (
++            self.mhc["start"] <= self.physical_index < self.mhc["end"]
++        )
++        if self.mhc_active:
++            self.mhc_attn = MHCRouter(config.hidden_size, self.mhc)
++            self.mhc_ffn = MHCRouter(config.hidden_size, self.mhc)
++
++    def forward(
++        self,
++        hidden_states: torch.Tensor,
++        residual: torch.Tensor | None,
++        positions: torch.Tensor,
++        **kwargs: object,
++    ) -> tuple[torch.Tensor, torch.Tensor | None]:
++        if not self.mhc_active:
++            return super().forward(hidden_states, residual, positions, **kwargs)
++        if residual is not None:
++            hidden_states = hidden_states + residual
++        streams = self.mhc["streams"]
++        if self.physical_index == self.mhc["start"]:
++            hidden_states = hidden_states.unsqueeze(-2).expand(-1, streams, -1)
++        else:
++            hidden_states = hidden_states.unflatten(-1, (streams, -1))
++        branch, post, mix = self.mhc_attn(hidden_states)
++        branch = self.input_layernorm(branch.contiguous())
++        if self.layer_type == "linear_attention":
++            branch = self.linear_attn(hidden_states=branch)
++        else:
++            branch = self.self_attn(hidden_states=branch, positions=positions)
++        hidden_states = MHCRouter.merge(hidden_states, branch, post, mix)
++        branch, post, mix = self.mhc_ffn(hidden_states)
++        branch = self.mlp(self.post_attention_layernorm(branch.contiguous()))
++        hidden_states = MHCRouter.merge(hidden_states, branch, post, mix)
++        if self.physical_index == self.mhc["end"] - 1:
++            hidden_states = hidden_states.mean(-2)
++        else:
++            hidden_states = hidden_states.flatten(-2)
++        return hidden_states, None
++
++
++class SenseNovaLoopModel(nn.Module):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        self.config = vllm_config.model_config.hf_text_config
++        self.quant_config = None
++        self.vocab_size = self.config.vocab_size
++        self.embed_tokens = VocabParallelEmbedding(
++            self.vocab_size,
++            self.config.hidden_size,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
++        )
++        self.layers = nn.ModuleList(
++            SenseNovaLoopDecoderLayer(vllm_config, layer_type, f"{prefix}.layers.{i}")
++            for i, layer_type in enumerate(self.config.layer_types)
++        )
++        self.norm = Qwen3_5RMSNorm(
++            self.config.hidden_size, eps=self.config.rms_norm_eps
++        )
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        hidden_states = (
++            self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds
++        )
++        residual = None
++        for layer in self.layers:
++            hidden_states, residual = layer(hidden_states, residual, positions)
++        if residual is None:
++            return self.norm(hidden_states)
++        return self.norm(hidden_states, residual)[0]
++
++    def share_loop_parameters(self) -> None:
++        first: dict[int, nn.Module] = {}
++        for physical, layer in zip(self.config.loop_physical_indices, self.layers):
++            if physical not in first:
++                first[physical] = layer
++                continue
++            for name, param in first[physical].named_parameters():
++                parent, _, leaf = name.rpartition(".")
++                setattr(layer.get_submodule(parent), leaf, param)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        return AutoWeightsLoader(self).load_weights(
++            weights, mapper=Qwen3_5Model.hf_to_vllm_mapper
++        )
++
++
++class SenseNovaLoopForConditionalGeneration(
++    nn.Module, HasInnerState, IsHybrid, SupportsMRoPE
++):
++    @classmethod
++    def get_mamba_state_dtype_from_config(
++        cls, vllm_config: VllmConfig
++    ) -> tuple[torch.dtype, torch.dtype]:
++        return Qwen3_5ForCausalLMBase.get_mamba_state_dtype_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_shape_from_config(
++        cls, vllm_config: VllmConfig
++    ) -> tuple[tuple[int, int], tuple[int, int]]:
++        return Qwen3_5ForCausalLMBase.get_mamba_state_shape_from_config(vllm_config)
++
++    @classmethod
++    def get_mamba_state_copy_func(
++        cls,
++    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
++        return Qwen3_5ForCausalLMBase.get_mamba_state_copy_func()
++
++    get_mrope_input_positions = Qwen3_5ForCausalLMBase.get_mrope_input_positions
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        self.vllm_config = vllm_config
++        self.model_config = vllm_config.model_config
++        self.config = self.model_config.hf_text_config
++        if (
++            vllm_config.parallel_config.pipeline_parallel_size != 1
++            or vllm_config.quant_config is not None
++            or vllm_config.speculative_config is not None
++            or vllm_config.lora_config is not None
++            or getattr(self.config, "layer_scale", False)
++        ):
++            raise ValueError(
++                "SenseNova Loop currently requires unquantized text inference "
++                "without pipeline parallelism, LoRA, speculation or layer_scale"
++            )
++        self.quant_config = None
++        self.scheduler_config = vllm_config.scheduler_config
++        self.model = SenseNovaLoopModel(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
++        )
++        self.lm_head = ParallelLMHead(
++            self.config.vocab_size,
++            self.config.hidden_size,
++            prefix=maybe_prefix(prefix, "lm_head"),
++        )
++        if self.config.tie_word_embeddings:
++            self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
++        self.logits_processor = LogitsProcessor(self.config.vocab_size)
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.embed_input_ids(input_ids)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
++        inputs_embeds: torch.Tensor | None = None,
++        **kwargs: object,
++    ) -> torch.Tensor:
++        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
++
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        destinations: dict[int, list[int]] = {}
++        for execution, physical in enumerate(self.config.loop_physical_indices):
++            destinations.setdefault(physical, []).append(execution)
++
++        def expanded_weights() -> Iterable[tuple[str, torch.Tensor]]:
++            for name, weight in weights:
++                name = name.replace("model.language_model.", "model.", 1)
++                if name == "model.loop_gate.logits":
++                    continue
++                if name.startswith(("model.visual.", "visual.", "mtp.")):
++                    continue
++                if name.startswith("model.layers."):
++                    _, _, index, suffix = name.split(".", 3)
++                    for execution in destinations[int(index)]:
++                        yield f"model.layers.{execution}.{suffix}", weight
++                else:
++                    yield name, weight
++
++        return AutoWeightsLoader(self).load_weights(expanded_weights())
++
++    def process_weights_after_loading(self) -> None:
++        # Parameters share storage; attention modules and their caches stay distinct.
++        self.model.share_loop_parameters()
+diff --git a/vllm/transformers_utils/config.py b/vllm/transformers_utils/config.py
+index dad35bca3253..780d48729068 100644
+--- a/vllm/transformers_utils/config.py
++++ b/vllm/transformers_utils/config.py
+@@ -162,6 +162,7 @@ def __getitem__(self, key):
+     speculators="SpeculatorsConfig",
+     openvla="OpenVLAConfig",
+     ovis="OvisConfig",
++    sensenova_loop="SenseNovaLoopConfig",
+     ultravox="UltravoxConfig",
+     step3_vl="Step3VLConfig",
+     step3_text="Step3TextConfig",
+diff --git a/vllm/transformers_utils/configs/__init__.py b/vllm/transformers_utils/configs/__init__.py
+index 0e4dcef8426e..e20ab64b76ad 100644
+--- a/vllm/transformers_utils/configs/__init__.py
++++ b/vllm/transformers_utils/configs/__init__.py
+@@ -69,6 +69,7 @@
+     "OvisConfig": "vllm.transformers_utils.configs.ovis",
+     "PixelShuffleSiglip2VisionConfig": "vllm.transformers_utils.configs.isaac",
+     "RadioConfig": "vllm.transformers_utils.configs.radio",
++    "SenseNovaLoopConfig": "vllm.transformers_utils.configs.sensenova_loop",
+     "SpeculatorsConfig": "vllm.transformers_utils.configs.speculators",
+     "UltravoxConfig": "vllm.transformers_utils.configs.ultravox",
+     "UnlimitedOCRConfig": "vllm.transformers_utils.configs.unlimited_ocr",
+@@ -142,6 +143,7 @@
+     "OvisConfig",
+     "PixelShuffleSiglip2VisionConfig",
+     "RadioConfig",
++    "SenseNovaLoopConfig",
+     "SpeculatorsConfig",
+     "UltravoxConfig",
+     "UnlimitedOCRConfig",
+diff --git a/vllm/transformers_utils/configs/sensenova_loop.py b/vllm/transformers_utils/configs/sensenova_loop.py
+new file mode 100644
+index 000000000000..223e1ca72c67
+--- /dev/null
++++ b/vllm/transformers_utils/configs/sensenova_loop.py
+@@ -0,0 +1,91 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import math
++from typing import Any
++
++from transformers import PreTrainedConfig, Qwen3_5Config
++
++
++class SenseNovaLoopConfig(Qwen3_5Config):
++    model_type = "sensenova_loop"
++
++    def __init__(
++        self,
++        loop_settings: dict[str, Any] | None = None,
++        mhc: dict[str, Any] | None = None,
++        loop_physical_num_layers: int | None = None,
++        loop_physical_layer_types: list[str] | None = None,
++        **kwargs,
++    ) -> None:
++        super().__init__(**kwargs)
++        self.loop_settings = loop_settings
++        self.mhc = mhc
++        self.loop_physical_num_layers = (
++            loop_physical_num_layers or self.text_config.num_hidden_layers
++        )
++        self.loop_physical_layer_types = list(
++            loop_physical_layer_types or self.text_config.layer_types
++        )
++        self.get_text_config()
++
++    def get_text_config(self, **kwargs) -> PreTrainedConfig:
++        text = super().get_text_config(**kwargs)
++        # vLLM applies HF overrides after constructing this config.
++        if not hasattr(self, "loop_physical_num_layers") or text is self:
++            return text
++        mhc = self.mhc
++        num_layers = self.loop_physical_num_layers
++        loop_settings = self.loop_settings
++        if loop_settings is None:
++            loop_settings = {"start": 0, "end": num_layers, "eval_count": 1}
++        start, end, count = (loop_settings[k] for k in ("start", "end", "eval_count"))
++        if (
++            any(type(v) is not int for v in (start, end, count))
++            or not 0 <= start < end <= num_layers
++            or count < 1
++            or loop_settings.get("use_gate", False)
++        ):
++            raise ValueError(
++                "Loop requires valid fixed bounds/count and use_gate=false"
++            )
++        indices = list(range(start)) + list(range(start, end)) * count
++        indices += list(range(end, num_layers))
++        layer_types = self.loop_physical_layer_types
++        if len(layer_types) != num_layers:
++            raise ValueError("layer_types must describe the physical layers")
++        if mhc is not None:
++            pre_scale = mhc.get("pre_scale", 1.0)
++            if (
++                not isinstance(pre_scale, (int, float))
++                or not math.isfinite(pre_scale)
++                or pre_scale <= 0
++            ):
++                raise ValueError(
++                    "Invalid mHC pre_scale: expected a positive finite number"
++                )
++            mhc_start, mhc_end, streams, iterations = (
++                mhc[k] for k in ("start", "end", "streams", "iterations")
++            )
++            bounds = (0, start, end, num_layers)
++            if (
++                any(
++                    type(v) is not int
++                    for v in (mhc_start, mhc_end, streams, iterations)
++                )
++                or streams not in (2, 4)
++                or iterations < 1
++                or type(mhc["fixed_identity"]) is not bool
++                or not any(
++                    left <= mhc_start < mhc_end <= right
++                    for left, right in zip(bounds, bounds[1:])
++                )
++            ):
++                raise ValueError(
++                    "Invalid mHC settings or range crossing a loop boundary"
++                )
++        text.loop_physical_indices = indices
++        text.mhc = mhc
++        text.num_hidden_layers = len(indices)
++        text.layer_types = [layer_types[i] for i in indices]
++        return text
