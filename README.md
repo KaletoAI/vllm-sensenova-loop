@@ -31,10 +31,10 @@ SenseNova-Loop-9B release. Early-stage community code, so bug reports are very w
 | Checkpoint | Result on GB10 (vLLM 0.31.0, single GPU) |
 |---|---|
 | [sensenova/SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) (BF16, YaRN 512K config) | ✅ text and images, matches transformers |
-| [Kaleto/SenseNova-Loop-9B-NVFP4](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4) (ModelOpt `W4A16_NVFP4`, MLP + attention + DeltaNet) | ✅ text and images, `MarlinNvFp4LinearKernel`, reasoning and tool-call parsers checked |
-| [Kaleto/SenseNova-Loop-9B-NVFP4-MLP](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4-MLP) (ModelOpt `W4A16_NVFP4`, MLP only) | ✅ text and images |
+| [Kaleto/SenseNova-Loop-9B-NVFP4](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4) (ModelOpt `W4A16_NVFP4`, MLP + attention + DeltaNet + LM head) | ✅ text, images and MTP, `MarlinNvFp4LinearKernel`, reasoning and tool-call parsers checked |
+| [Kaleto/SenseNova-Loop-9B-NVFP4-MLP](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4-MLP) (ModelOpt `W4A16_NVFP4`, MLP + LM head) | ✅ text, images and MTP |
 | [sensenova/SenseNova-Loop-9B-AWQ](https://huggingface.co/sensenova/SenseNova-Loop-9B-AWQ) @ `64bd16ea` (official AWQ, INT4 embedding and LM head) | ✅ text, images and MTP, AWQ Marlin kernel |
-| an NVFP4 checkpoint whose LM head is NVFP4 too (`lm_head` not in `exclude_modules`) | ✅ text, images and MTP |
+| older NVFP4 checkpoints with a BF16 LM head (`lm_head` in `exclude_modules`) | ✅ text, images and MTP |
 | an NVFP4 checkpoint that also quantizes `in_proj_a/b` (fused `in_proj_ba`) | ✅ loads and runs |
 
 Speed on one GB10 with `tests/bench_mtp.py`: six chat tasks (English and German, code, explanation,
@@ -44,15 +44,17 @@ and in total for four concurrent streams:
 | Checkpoint | Weights in memory | No MTP, 1 / 4 streams | MTP k=1, 1 / 4 streams | MTP acceptance (k=1) |
 |---|---:|---:|---:|---:|
 | BF16 | 17.8 GiB | 7.5 / 22 | 12.2 / 31 | 70 % |
-| NVFP4 (full decoder, BF16 LM head) | 8.5 GiB | 21.3 / 75 | 27.9 / 99 | 68 % |
-| NVFP4 (full decoder, NVFP4 LM head) | 7.2 GiB | 25.9 / 90 | 36.6 / 126 | 67 % |
-| NVFP4-MLP (BF16 LM head) | 11.3 GiB | 12.3 / 50 | 20.1 / 67 | 70 % |
+| NVFP4 (full decoder + LM head) | 7.2 GiB | 25.9 / 90 | 36.6 / 126 | 67 % |
+| NVFP4-MLP (MLP + LM head) | 10.0 GiB | 14.0 / 53 | 24.6 / 76 | 69 % |
+| NVFP4, BF16 LM head (before 2026-11-19) | 8.5 GiB | 21.3 / 75 | 27.9 / 99 | 68 % |
+| NVFP4-MLP, BF16 LM head (before 2026-11-19) | 11.3 GiB | 12.3 / 50 | 20.1 / 67 | 70 % |
 | SenseNova AWQ | 5.5 GiB | 27.5 / 77 | 39.4 / 104 | 69 % |
 
 Weights in memory include the BF16 vision tower; MTP adds 0.5 GiB. The LM head (248,320 × 4,096)
-is read in full at every decode step, so quantizing it pays off: NVFP4 with an NVFP4 LM head
-(weight-only, no calibration needed) is 22 % faster than with a BF16 head, at a mean KLD of
-0.160 instead of 0.153 against BF16.
+is read in full at every decode step, so quantizing it pays off: with an NVFP4 LM head (weight-only,
+no calibration needed) the full-decoder build is 22 % faster (mean KLD against BF16 0.160 instead
+of 0.153) and the MLP build 14 % faster (0.094 instead of 0.086). Both Kaleto builds on Hugging Face
+have the NVFP4 LM head since 2026-11-19.
 
 k=2 and k=3 accept more tokens per step but are not faster on GB10 (BF16 k=2 is the exception:
 13.0 tok/s). With temperature 1.0 / top_p 0.95 / top_k 20 single-stream speed drops by ~4 %.
