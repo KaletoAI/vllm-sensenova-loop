@@ -11,6 +11,9 @@ suggested a plugin instead. This plugin is built on that PR's implementation (se
 first commit holds the PR files unchanged). On top of it, it adds:
 
 - **loading as a plugin** through the `vllm.general_plugins` entry point, with stock vLLM and no fork
+- **image input.** The Qwen3.5 vision tower, processor and M-RoPE come from vLLM's own Qwen3.5
+  model, exactly as SenseNova's modeling code reuses transformers' Qwen3.5; only the language model
+  is the looped decoder. Checked against SenseNova's transformers code token by token (see below).
 - **ModelOpt NVFP4 checkpoints.** A checkpoint's `exclude_modules` name *physical* layers, while vLLM
   builds one module per loop *execution*, so the plugin expands every physical-layer entry to all of
   its executions. Fused projections (`qkv_proj`, `gate_up_proj`, `in_proj_qkvz`, `in_proj_ba`) are
@@ -23,9 +26,9 @@ SenseNova-Loop-9B release. Early-stage community code, so bug reports are very w
 
 | Checkpoint | Result on GB10 (vLLM 0.31.0, single GPU) |
 |---|---|
-| [sensenova/SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) (BF16, YaRN 512K config) | ✅ serves, correct greedy answers |
-| [Kaleto/SenseNova-Loop-9B-NVFP4](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4) (ModelOpt `W4A16_NVFP4`, MLP + attention + DeltaNet) | ✅ `MarlinNvFp4LinearKernel`, reasoning and tool-call parsers checked |
-| [Kaleto/SenseNova-Loop-9B-NVFP4-MLP](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4-MLP) (ModelOpt `W4A16_NVFP4`, MLP only) | ✅ |
+| [sensenova/SenseNova-Loop-9B](https://huggingface.co/sensenova/SenseNova-Loop-9B) (BF16, YaRN 512K config) | ✅ text and images, matches transformers |
+| [Kaleto/SenseNova-Loop-9B-NVFP4](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4) (ModelOpt `W4A16_NVFP4`, MLP + attention + DeltaNet) | ✅ text and images, `MarlinNvFp4LinearKernel`, reasoning and tool-call parsers checked |
+| [Kaleto/SenseNova-Loop-9B-NVFP4-MLP](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4-MLP) (ModelOpt `W4A16_NVFP4`, MLP only) | ✅ text and images |
 | an NVFP4 checkpoint that also quantizes `in_proj_a/b` (fused `in_proj_ba`) | ✅ loads and runs |
 
 Speed on one GB10: ~4.8K-token prompt, 256 decoded tokens, greedy, BF16 KV cache, no speculative
@@ -37,7 +40,25 @@ decoding. Measured with `tests/bench_speed.py`.
 | NVFP4 (full decoder) | 7.7 GiB | 1,492 | 21.2 tok/s | 81.1 tok/s |
 | NVFP4-MLP | 10.5 GiB | 1,563 | 12.4 tok/s | 54.6 tok/s |
 
-Not tested yet: tensor parallelism (the upstream code supports it), the Preview checkpoint,
+Images, compared with SenseNova's own transformers code (BF16) on 7 probes: shapes, OCR, a bar
+chart with a German question, a photo, a 1280×640 banner, two images in one message, and text
+before the image. For each probe vLLM's prompt token ids are identical to the HF processor's, and HF
+is run teacher-forced on vLLM's greedy answer:
+
+| Checkpoint in vLLM | Same top token as HF BF16 | \|Δ logprob\| of vLLM's tokens: mean per probe / max |
+|---|---:|---:|
+| BF16 | 94–100 % (every miss is an exact tie) | 0.000–0.017 / 0.12 |
+| NVFP4 | 93–100 % | 0.04–0.09 / 1.42 |
+| NVFP4-MLP | 88–100 % | 0.02–0.16 / 3.13* |
+
+\* At that token the NVFP4-MLP build reads "SENSENOVA" correctly where BF16 reads "SENENA".
+
+Answers to all seven probes are correct for all three checkpoints. Sending the probes concurrently
+gives the same tokens as sending them one by one, except at near-ties (top-1/top-2 margin ≤ 0.125),
+which batching can flip in vLLM. The vision tower stays BF16 in the NVFP4 checkpoints (+0.85 GiB).
+Text speed is unchanged by the vision support.
+
+Not tested yet: video input, tensor parallelism (the upstream code supports it), the Preview checkpoint,
 `NVFP4` W4A4 checkpoints, and GPUs other than GB10.
 
 ## Install
@@ -72,16 +93,19 @@ Thinking is on by default. Turn it off per request with
 
 Inherited from #64832 unless noted:
 
-- text only: the vision tower and the MTP head are skipped while loading
-- no speculative decoding (MTP), pipeline parallelism, LoRA, CPU offload, or `sharded_state` loading
+- the MTP head is skipped while loading, so no speculative decoding (MTP)
+- video input goes through the same Qwen3.5 code but is untested; `--limit-mm-per-prompt '{"video": 0}'` turns it off
+- no pipeline parallelism, LoRA, CPU offload, or `sharded_state` loading
 - quantization: ModelOpt FP4 only (added by this plugin). Other methods are rejected.
 
-MTP and vision are the obvious next steps. Help is welcome.
+MTP is the obvious next step. Help is welcome.
 
 ## Tests
 
 `tests/serve_smoke.sh <model_dir> <name>` serves a checkpoint with the plugin in the vLLM 0.31.0
-image and runs four greedy chat prompts. `tests/speed_ab.sh name=dir ...` does the same and then runs
+image and runs four greedy chat prompts. `tests/vision_probe.py` sends image prompts to a running
+server and `tests/vision_ref_hf.py` checks the answers against SenseNova's transformers code
+(transformers 5.18, exit code 1 on a mismatch). `tests/speed_ab.sh name=dir ...` does the same and then runs
 `tests/bench_speed.py`.
 
 ## Credits
