@@ -36,6 +36,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_sensenova_loop.awq import AWQ_QUANTIZATION, awq_embedding_method, extend_awq_skips, is_awq
 from vllm_sensenova_loop.config import SenseNovaLoopConfig
 from vllm_sensenova_loop.mhc import MHCRouter
 
@@ -95,6 +96,7 @@ class SenseNovaLoopModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             self.config.hidden_size,
+            quant_method=awq_embedding_method(self.quant_config, self.config),
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.layers = nn.ModuleList(
@@ -141,7 +143,7 @@ class SenseNovaLoopModel(nn.Module):
         )
 
 
-SUPPORTED_QUANTIZATION = {"modelopt_fp4"}
+SUPPORTED_QUANTIZATION = {"modelopt_fp4", AWQ_QUANTIZATION}
 
 # Matches decoder-layer entries in both naming schemes: the checkpoint's
 # ``model.language_model.layers.N`` after the multimodal weights mapper
@@ -178,6 +180,9 @@ def remap_exclude_modules(quant_config, loop_indices) -> None:
             elif p in ("model.visual", "visual"):
                 p = "visual"
             elif p == "lm_head":
+                # Keep the bare name too: the MTP draft builds its own "lm_head"
+                # with this quant config (it is then replaced by the target's).
+                remapped.add(p)
                 p = "language_model.lm_head"
             m = _LAYER_ENTRY.fullmatch(p)
             if m is None:
@@ -208,9 +213,12 @@ class SenseNovaLoopForCausalLM(nn.Module):
         self.model = SenseNovaLoopModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        quant_config = vllm_config.quant_config
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
+            # The AWQ release ships an INT4 LM head; ModelOpt builds keep it in BF16.
+            quant_config=quant_config if is_awq(quant_config) else None,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         if self.config.tie_word_embeddings:
@@ -305,15 +313,16 @@ class SenseNovaLoopForConditionalGeneration(Qwen3_5ForConditionalGeneration, Has
         nn.Module.__init__(self)
         config = vllm_config.model_config.hf_config
         text_config = vllm_config.model_config.hf_text_config
+        speculative = vllm_config.speculative_config
         if (
             vllm_config.parallel_config.pipeline_parallel_size != 1
-            or vllm_config.speculative_config is not None
+            or (speculative is not None and speculative.method != "mtp")
             or vllm_config.lora_config is not None
             or getattr(text_config, "layer_scale", False)
         ):
             raise ValueError(
-                "SenseNova Loop currently requires inference without "
-                "pipeline parallelism, LoRA, speculation or layer_scale"
+                "SenseNova Loop currently requires inference without pipeline "
+                "parallelism, LoRA or layer_scale; speculation only via MTP"
             )
         quant_config = vllm_config.quant_config
         if quant_config is not None:
@@ -323,8 +332,13 @@ class SenseNovaLoopForConditionalGeneration(Qwen3_5ForConditionalGeneration, Has
                     f"checkpoints, got {quant_config.get_name()!r}"
                 )
             remap_exclude_modules(quant_config, text_config.loop_physical_indices)
+            extend_awq_skips(quant_config)
         multimodal_config = vllm_config.model_config.get_multimodal_config()
 
+        # vLLM's MTP proposer reads image_token_index from configs it does not
+        # recognise by class name; Qwen3.5 configs call it image_token_id.
+        if getattr(config, "image_token_index", None) is None:
+            config.image_token_index = config.image_token_id
         self.config = config
         self.model_config = vllm_config.model_config
         self.vllm_config = vllm_config

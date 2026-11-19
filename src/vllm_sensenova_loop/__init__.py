@@ -7,6 +7,7 @@ Registered through the ``vllm.general_plugins`` entry point; vLLM calls
 
 ARCH = "SenseNovaLoopForConditionalGeneration"
 MODEL_TYPE = "sensenova_loop"
+AWQ_ARCH_ALIAS = "Qwen3_5LoopForConditionalGeneration"
 
 
 def register() -> None:
@@ -15,14 +16,21 @@ def register() -> None:
     from vllm.transformers_utils.config import _CONFIG_REGISTRY
 
     from vllm_sensenova_loop.config import SenseNovaLoopConfig
+    from vllm_sensenova_loop.mtp import MTP_ARCH, patch_speculative_config
     from vllm_sensenova_loop.verify import SenseNovaLoopVerifyConfig
 
     # vLLM resolves model_type -> config class through _CONFIG_REGISTRY before
     # falling back to transformers' AutoConfig (no trust_remote_code needed).
     if MODEL_TYPE not in _CONFIG_REGISTRY:
         _CONFIG_REGISTRY[MODEL_TYPE] = SenseNovaLoopConfig
-    MODELS_CONFIG_MAP.setdefault(ARCH, SenseNovaLoopVerifyConfig)
-    if ARCH not in ModelRegistry.get_supported_archs():
-        ModelRegistry.register_model(
-            ARCH, "vllm_sensenova_loop.model:SenseNovaLoopForConditionalGeneration"
-        )
+    # SenseNova's AWQ release names the architecture Qwen3_5LoopForConditionalGeneration.
+    for arch in (ARCH, AWQ_ARCH_ALIAS):
+        MODELS_CONFIG_MAP.setdefault(arch, SenseNovaLoopVerifyConfig)
+        if arch not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model(
+                arch, "vllm_sensenova_loop.model:SenseNovaLoopForConditionalGeneration"
+            )
+    # MTP speculative decoding: the draft config resolves to SenseNovaLoopMTP.
+    if MTP_ARCH not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(MTP_ARCH, "vllm_sensenova_loop.mtp:SenseNovaLoopMTP")
+    patch_speculative_config()

@@ -5,6 +5,9 @@ are derived from vllm-project/vllm pull request #64832 "[Model] Add SenseNova
 Loop support" by sufubao (head 86014ad44c3fab4be89dfc169f5365ed850fd195),
 Copyright contributors to the vLLM project, licensed under Apache-2.0.
 The first commit of this repository contains those files unchanged.
+The INT4 embedding method in src/vllm_sensenova_loop/awq.py is from the same
+pull request, commit 202d66c6893251e6119efb308e9a9e729a53139d "[Model] Support
+SenseNova Loop AWQ checkpoints".
 
 SenseNova Loop model architecture and weights: SenseNova / SenseTime
 (sensenova/SenseNova-Loop-9B, Apache-2.0).
