@@ -34,6 +34,7 @@ SenseNova-Loop-9B release. Early-stage community code, so bug reports are very w
 | [Kaleto/SenseNova-Loop-9B-NVFP4](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4) (ModelOpt `W4A16_NVFP4`, MLP + attention + DeltaNet) | ✅ text and images, `MarlinNvFp4LinearKernel`, reasoning and tool-call parsers checked |
 | [Kaleto/SenseNova-Loop-9B-NVFP4-MLP](https://huggingface.co/Kaleto/SenseNova-Loop-9B-NVFP4-MLP) (ModelOpt `W4A16_NVFP4`, MLP only) | ✅ text and images |
 | [sensenova/SenseNova-Loop-9B-AWQ](https://huggingface.co/sensenova/SenseNova-Loop-9B-AWQ) @ `64bd16ea` (official AWQ, INT4 embedding and LM head) | ✅ text, images and MTP, AWQ Marlin kernel |
+| an NVFP4 checkpoint whose LM head is NVFP4 too (`lm_head` not in `exclude_modules`) | ✅ text, images and MTP |
 | an NVFP4 checkpoint that also quantizes `in_proj_a/b` (fused `in_proj_ba`) | ✅ loads and runs |
 
 Speed on one GB10 with `tests/bench_mtp.py`: six chat tasks (English and German, code, explanation,
@@ -42,10 +43,16 @@ and in total for four concurrent streams:
 
 | Checkpoint | Weights in memory | No MTP, 1 / 4 streams | MTP k=1, 1 / 4 streams | MTP acceptance (k=1) |
 |---|---:|---:|---:|---:|
-| BF16 | 16.9 GiB | 7.5 / 22 | 12.2 / 31 | 70 % |
-| NVFP4 (full decoder) | 7.7 GiB | 21.3 / 75 | 27.9 / 99 | 68 % |
-| NVFP4-MLP | 10.5 GiB | 12.3 / 50 | 20.1 / 67 | 70 % |
+| BF16 | 17.8 GiB | 7.5 / 22 | 12.2 / 31 | 70 % |
+| NVFP4 (full decoder, BF16 LM head) | 8.5 GiB | 21.3 / 75 | 27.9 / 99 | 68 % |
+| NVFP4 (full decoder, NVFP4 LM head) | 7.2 GiB | 25.9 / 90 | 36.6 / 126 | 67 % |
+| NVFP4-MLP (BF16 LM head) | 11.3 GiB | 12.3 / 50 | 20.1 / 67 | 70 % |
 | SenseNova AWQ | 5.5 GiB | 27.5 / 77 | 39.4 / 104 | 69 % |
+
+Weights in memory include the BF16 vision tower; MTP adds 0.5 GiB. The LM head (248,320 × 4,096)
+is read in full at every decode step, so quantizing it pays off: NVFP4 with an NVFP4 LM head
+(weight-only, no calibration needed) is 22 % faster than with a BF16 head, at a mean KLD of
+0.160 instead of 0.153 against BF16.
 
 k=2 and k=3 accept more tokens per step but are not faster on GB10 (BF16 k=2 is the exception:
 13.0 tok/s). With temperature 1.0 / top_p 0.95 / top_k 20 single-stream speed drops by ~4 %.
@@ -57,7 +64,7 @@ The table below is the older single-prompt benchmark (`tests/bench_speed.py`: ~4
 
 | Checkpoint | Weights in memory | Prefill tok/s | Decode, 1 stream | Decode, 4 streams (total) |
 |---|---:|---:|---:|---:|
-| BF16 | 16.9 GiB | 1,785 | 7.5 tok/s | 31.1 tok/s |
+| BF16 | 16.9 GiB (text only) | 1,785 | 7.5 tok/s | 31.1 tok/s |
 | NVFP4 (full decoder) | 7.7 GiB | 1,492 | 21.2 tok/s | 81.1 tok/s |
 | NVFP4-MLP | 10.5 GiB | 1,563 | 12.4 tok/s | 54.6 tok/s |
 

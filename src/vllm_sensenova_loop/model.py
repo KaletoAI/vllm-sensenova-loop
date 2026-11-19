@@ -217,8 +217,9 @@ class SenseNovaLoopForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
-            # The AWQ release ships an INT4 LM head; ModelOpt builds keep it in BF16.
-            quant_config=quant_config if is_awq(quant_config) else None,
+            # Quantized if the checkpoint quantizes it (AWQ release, NVFP4 builds without
+            # "lm_head" in exclude_modules); excluded heads get UnquantizedLinearMethod.
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         if self.config.tie_word_embeddings:
